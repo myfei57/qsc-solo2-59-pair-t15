@@ -14,6 +14,7 @@ class BmsSnapshot:
     latches: dict
     pending_faults: list
     calibration: dict
+    fault_history: dict
 
     def as_dict(self) -> dict:
         return {
@@ -22,4 +23,5 @@ class BmsSnapshot:
             "latches": dict(self.latches),
             "pending_faults": list(self.pending_faults),
             "calibration": dict(self.calibration),
+            "fault_history": {rack_id: list(records) for rack_id, records in self.fault_history.items()},
         }

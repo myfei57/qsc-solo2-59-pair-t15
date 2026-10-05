@@ -34,9 +34,10 @@ def test_audit_log_records_and_queries(platform):
     assert platform.audit.replay_from_journal(limit=5)
 
 
-def test_audit_snapshot_and_timeline(platform):
+def test_audit_snapshot_and_timeline(platform, clock):
     platform.start()
     platform.report_fault("rk-01", "cell_over_temp")
+    clock.advance(5.0)
     platform.report_fault("rk-01", "cell_over_temp")
     snapshot = platform.audit_snapshot()
     assert snapshot["journal_count"] > 0
@@ -49,9 +50,10 @@ def test_audit_snapshot_and_timeline(platform):
     assert build_timeline(platform.audit.records(limit=50), station="other") == []
 
 
-def test_alarms_only_contain_warning_and_alarm(platform):
+def test_alarms_only_contain_warning_and_alarm(platform, clock):
     platform.start()
     platform.report_fault("rk-01", "cell_over_temp")
+    clock.advance(5.0)
     platform.report_fault("rk-01", "cell_over_temp")
     alarms = platform.audit.alarms()
     assert alarms

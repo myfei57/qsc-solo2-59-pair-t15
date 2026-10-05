@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from ..config import BmsLimits, PcsLimits, RackLimits
+from ..errors import InterlockError
 from ..rack.alarms import collect_alarms
 from ..rack.mapping import RackMapping
 from ..rack.rack import Rack
@@ -69,14 +70,14 @@ class Bms:
     def latched(self, rack_id: str) -> bool:
         """某簇是否处于闩锁保持中。"""
 
-        return self._latch.held(rack_id, self._clock.now())
+        return self._latch.held(rack_id)
 
     def ready(self, rack: Rack) -> ReadyReport:
         """核对一簇的就绪判据，并同步 BMS 档位。"""
 
         report = self._gate.evaluate(rack, self.latched(rack.rack_id))
         self._status.note_check(report.ready)
-        if self._latch.active(self._clock.now()):
+        if self._latch.active():
             self._status.transition("fault", "fault_latched")
         elif report.ready:
             self._status.transition("ready", "ready_gate_passed")
@@ -89,29 +90,43 @@ class Bms:
 
         report = self.ready(rack)
         if not report.ready:
-            from ..errors import InterlockError
-
             raise InterlockError(
                 f"BMS 未就绪: {','.join(report.reasons)}",
                 component="bms",
             )
         return report
 
-    def report_fault(self, rack_id: str, code: str) -> dict:
-        """登记一次故障上报（并发安全）。"""
+    def report_fault(self, rack_id: str, code: str, round_id=None) -> dict:
+        """登记一次故障上报（并发安全，同一采样轮次的重复上报只算一次）。"""
 
-        result = self._faults.report(rack_id, code, self._clock.now())
+        result = self._faults.report(rack_id, code, self._clock.now(), round_id=round_id)
         if result["latched"]:
             self._status.transition("fault", f"fault_latched:{code}")
         return result
 
-    def clear_fault(self, rack_id: str) -> bool:
-        """清除某簇故障计数并释放闩锁。"""
+    def clear_fault(self, rack: Rack, operator: str = "manual") -> dict:
+        """人工确认恢复：保持期已满且采集值回到正常才放行，并留下代际记录。"""
 
-        cleared = self._faults.clear(rack_id)
-        if not self._latch.active(self._clock.now()):
+        now = self._clock.now()
+        if not self._latch.held(rack.rack_id):
+            self._faults.reset(rack.rack_id)
+            return {"rack_id": rack.rack_id, "cleared": False, "reason": "not_latched"}
+        remaining = self._latch.hold_remaining_s(rack.rack_id, now)
+        if remaining > 0:
+            raise InterlockError(
+                f"闩锁最短保持期未满，还需 {remaining:.1f}s",
+                component="bms",
+            )
+        report = self._gate.evaluate(rack, latched=False)
+        if not report.ready:
+            raise InterlockError(
+                f"恢复条件不满足: {','.join(report.reasons)}",
+                component="bms",
+            )
+        record = self._faults.clear(rack.rack_id, now)
+        if not self._latch.active():
             self._status.transition("standby", "faults_cleared")
-        return cleared
+        return {"rack_id": rack.rack_id, "cleared": True, "operator": operator, "record": record}
 
     def calibrate(self, soc_pct: float, source: str = "manual") -> dict:
         """登记一次 SOC 校准。"""
@@ -168,4 +183,5 @@ class Bms:
             latches=self._latch.snapshot(),
             pending_faults=self._faults.pending(),
             calibration=self._calibration.latest(self._clock.now()),
+            fault_history=self._latch.histories(),
         )

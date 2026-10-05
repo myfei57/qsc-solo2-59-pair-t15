@@ -230,10 +230,14 @@ class Api:
         return self._platform.report_fault(
             rack_id=body.get("rack_id"),
             code=str(body.get("code", "bms_fault")),
+            round_id=body.get("round_id"),
         )
 
     def _fault_clear(self, params: dict, body: dict) -> dict:
-        return self._platform.clear_fault(rack_id=body.get("rack_id"))
+        return self._platform.clear_fault(
+            rack_id=body.get("rack_id"),
+            operator=str(body.get("operator", "console")),
+        )
 
     def _drill(self, params: dict, body: dict) -> dict:
         return self._platform.fire_drill(

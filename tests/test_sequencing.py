@@ -61,7 +61,7 @@ def test_temperature_chain_refreshes_baseline(platform):
     assert platform.temp.baseline.rating_v == 3.4
 
 
-def test_cycle_and_concurrency_probes(platform):
+def test_cycle_and_concurrency_probes(platform, clock):
     bring_online(platform)
     cycle = platform.cycle()
     assert cycle["cycle"] == 1
@@ -79,6 +79,8 @@ def test_cycle_and_concurrency_probes(platform):
     blocked = platform.readiness()
     assert blocked["all_ready"] is False
     assert all("fault_latched" in item["reasons"] for item in blocked["racks"].values())
+    # 闩锁是粘性的：保持期届满且人工确认后才放行
+    clock.advance(platform.config.bms.fault_latch_s + 1.0)
     platform.clear_fault("rk-01")
     platform.clear_fault("rk-02")
     assert platform.readiness()["all_ready"] is True

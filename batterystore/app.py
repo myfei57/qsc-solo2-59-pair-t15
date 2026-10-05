@@ -456,11 +456,11 @@ class Platform:
             summary = self._record_operation(op_id, "calibrate", report)
             return {**report, **summary}
 
-    def report_fault(self, rack_id: str | None = None, code: str = "bms_fault") -> dict:
-        """登记一次故障上报（可并发调用）。"""
+    def report_fault(self, rack_id: str | None = None, code: str = "bms_fault", round_id=None) -> dict:
+        """登记一次故障上报（可并发调用；``round_id`` 标识采样轮次，用于去重）。"""
 
         with self._lock:
-            result = self.bms.report_fault(rack_id or DEFAULT_RACK, code)
+            result = self.bms.report_fault(rack_id or DEFAULT_RACK, code, round_id=round_id)
             self._faults_reported += 1
             self.bus.publish(
                 Event.of(
@@ -474,14 +474,29 @@ class Platform:
             )
             return result
 
-    def clear_fault(self, rack_id: str | None = None) -> dict:
-        """清除某簇故障计数与闩锁。"""
+    def clear_fault(self, rack_id: str | None = None, operator: str = "manual") -> dict:
+        """人工确认恢复某簇故障：保持期与恢复条件都满足才放行，并留下代际记录。"""
 
         with self._lock:
             key = rack_id or DEFAULT_RACK
-            cleared = self.bms.clear_fault(key)
-            self.bus.publish(Event.of("bms", "bms", "fault_clear", station=self.station, severity="notice", rack_id=key))
-            return {"rack_id": key, "cleared": cleared}
+            result = self.bms.clear_fault(self._rack(key), operator=operator)
+            if result["cleared"]:
+                self.bus.publish(
+                    Event.of(
+                        "bms",
+                        "bms",
+                        "fault_recovered",
+                        station=self.station,
+                        severity="notice",
+                        operator=operator,
+                        **result["record"],
+                    )
+                )
+            else:
+                self.bus.publish(
+                    Event.of("bms", "bms", "fault_clear", station=self.station, severity="notice", rack_id=key)
+                )
+            return result
 
     def fire_drill(
         self,
@@ -624,16 +639,18 @@ class Platform:
         }
 
     def concurrency_fault_probe(self, rounds: int = 16) -> dict:
-        """并发探测：多簇同时上报故障，核对闩锁是否每簇独立咬合。"""
+        """并发探测：多簇同时上报故障（含同轮次重复上报），核对闩锁是否每簇独立咬合。"""
 
         lock = threading.Lock()
         results: list[dict] = []
 
         def worker(rack_id: str) -> None:
-            for _ in range(rounds):
-                outcome = self.bms.report_fault(rack_id, "cell_over_temp")
-                with lock:
-                    results.append(outcome)
+            for round_no in range(rounds):
+                # 同一采样轮次并发重投两次，有效确认只能算一次。
+                for _ in range(2):
+                    outcome = self.bms.report_fault(rack_id, "cell_over_temp", round_id=round_no)
+                    with lock:
+                        results.append(outcome)
 
         rack_ids = sorted(self.racks)
         threads = [threading.Thread(target=worker, args=(rack_id,), name=f"fault-{rack_id}") for rack_id in rack_ids]
@@ -646,6 +663,7 @@ class Platform:
         return {
             "rounds": rounds,
             "reports": len(results),
+            "effective_reports": sum(1 for outcome in results if outcome["effective"]),
             "coverage": coverage,
             "missing": missing,
             "latched": sorted(rack_id for rack_id in rack_ids if self.bms.latched(rack_id)),
