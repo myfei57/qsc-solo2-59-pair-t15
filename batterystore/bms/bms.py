@@ -14,7 +14,7 @@ from ..rack.rack import Rack
 from .calibrate import Calibration
 from .charge import ChargePlan, build_charge_plan
 from .fault import FaultRegistry
-from .latch import FaultLatch
+from .latch import FaultLatch, RecoveryMode
 from .protection import evaluate_protection
 from .ready import ReadyGate, ReadyReport
 from .route import route_alarms
@@ -30,7 +30,12 @@ class Bms:
         self._rack_limits = rack_limits
         self._clock = clock
         self._status = BmsStatus()
-        self._latch = FaultLatch(limits.fault_latch_s)
+        self._latch = FaultLatch(
+            limits.fault_latch_s,
+            confirm_rounds=limits.confirm_rounds,
+            mode=RecoveryMode.MANUAL if limits.manual_recovery else RecoveryMode.AUTO,
+            recover_dwell_s=limits.recover_dwell_seconds,
+        )
         self._faults = FaultRegistry(self._latch, limits.confirm_rounds)
         self._calibration = Calibration(soc_ttl_s, 50.0)
         self._gate = ReadyGate(limits)
@@ -71,6 +76,11 @@ class Bms:
 
         return self._latch.held(rack_id, self._clock.now())
 
+    def sweep_recovery(self) -> list[str]:
+        """控制周期调用：评估全部簇是否已满足恢复条件，返回本次松开的簇。"""
+
+        return self._latch.sweep(self._clock.now())
+
     def ready(self, rack: Rack) -> ReadyReport:
         """核对一簇的就绪判据，并同步 BMS 档位。"""
 
@@ -97,18 +107,33 @@ class Bms:
             )
         return report
 
-    def report_fault(self, rack_id: str, code: str) -> dict:
-        """登记一次故障上报（并发安全）。"""
+    def report_fault(self, rack_id: str, code: str, dedup_key: object = None) -> dict:
+        """登记一次故障上报（并发安全、按簇独立咬合）。"""
 
-        result = self._faults.report(rack_id, code, self._clock.now())
-        if result["latched"]:
+        result = self._faults.report(rack_id, code, self._clock.now(), dedup_key=dedup_key)
+        if result.get("newly_engaged"):
             self._status.transition("fault", f"fault_latched:{code}")
         return result
 
-    def clear_fault(self, rack_id: str) -> bool:
-        """清除某簇故障计数并释放闩锁。"""
+    def acknowledge_fault(self, rack_id: str) -> dict:
+        """人工确认一簇当前代故障（人工恢复模式下的必要条件）。"""
 
-        cleared = self._faults.clear(rack_id)
+        return self._faults.acknowledge(rack_id, self._clock.now())
+
+    def observe_condition(self, rack_id: str, violating: bool) -> dict:
+        """上报一簇条件是否越限，驱动"持续正常才允许自动恢复"的判据。"""
+
+        return self._faults.observe_condition(rack_id, violating, self._clock.now())
+
+    def fault_generations(self, rack_id: str) -> list[dict]:
+        """返回某簇的代际记录（已封档历史 + 当前在持一代）。"""
+
+        return self._latch.generations(rack_id)
+
+    def clear_fault(self, rack_id: str) -> bool:
+        """清除某簇故障计数并释放闩锁（管理侧复位）。"""
+
+        cleared = self._faults.clear(rack_id, self._clock.now())
         if not self._latch.active(self._clock.now()):
             self._status.transition("standby", "faults_cleared")
         return cleared
@@ -164,8 +189,15 @@ class Bms:
 
         return BmsSnapshot(
             state=self._status.state,
-            counts={**self._status.counts(), "reports": self._faults.total_reports(), "route_misses": self._route_misses},
+            counts={
+                **self._status.counts(),
+                "reports": self._faults.total_reports(),
+                "duplicate_reports": self._faults.duplicate_reports(),
+                "route_misses": self._route_misses,
+            },
             latches=self._latch.snapshot(),
             pending_faults=self._faults.pending(),
             calibration=self._calibration.latest(self._clock.now()),
+            generations={rack_id: self.fault_generations(rack_id) for rack_id in self._latch.snapshot()},
+            recovery_mode=self._latch.mode.value,
         )

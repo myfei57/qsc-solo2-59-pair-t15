@@ -14,6 +14,8 @@ class BmsSnapshot:
     latches: dict
     pending_faults: list
     calibration: dict
+    generations: dict = None  # type: ignore[assignment]
+    recovery_mode: str = "auto"
 
     def as_dict(self) -> dict:
         return {
@@ -22,4 +24,6 @@ class BmsSnapshot:
             "latches": dict(self.latches),
             "pending_faults": list(self.pending_faults),
             "calibration": dict(self.calibration),
+            "generations": {rack_id: list(records) for rack_id, records in (self.generations or {}).items()},
+            "recovery_mode": self.recovery_mode,
         }

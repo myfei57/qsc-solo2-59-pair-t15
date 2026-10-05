@@ -92,6 +92,7 @@ class Api:
         add("POST", "/api/replace-pack", self._replace_pack)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/fault", self._fault)
+        add("POST", "/api/fault/ack", self._fault_ack)
         add("POST", "/api/fault/clear", self._fault_clear)
         add("POST", "/api/fire/drill", self._drill)
         add("POST", "/api/fire/release", lambda params, body: self._platform.release_fire())
@@ -230,7 +231,11 @@ class Api:
         return self._platform.report_fault(
             rack_id=body.get("rack_id"),
             code=str(body.get("code", "bms_fault")),
+            dedup_key=body.get("dedup_key"),
         )
+
+    def _fault_ack(self, params: dict, body: dict) -> dict:
+        return self._platform.acknowledge_fault(rack_id=body.get("rack_id"))
 
     def _fault_clear(self, params: dict, body: dict) -> dict:
         return self._platform.clear_fault(rack_id=body.get("rack_id"))

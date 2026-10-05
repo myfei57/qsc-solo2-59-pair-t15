@@ -456,11 +456,11 @@ class Platform:
             summary = self._record_operation(op_id, "calibrate", report)
             return {**report, **summary}
 
-    def report_fault(self, rack_id: str | None = None, code: str = "bms_fault") -> dict:
-        """登记一次故障上报（可并发调用）。"""
+    def report_fault(self, rack_id: str | None = None, code: str = "bms_fault", dedup_key: object = None) -> dict:
+        """登记一次故障上报（可并发调用、按簇独立咬合）。"""
 
         with self._lock:
-            result = self.bms.report_fault(rack_id or DEFAULT_RACK, code)
+            result = self.bms.report_fault(rack_id or DEFAULT_RACK, code, dedup_key=dedup_key)
             self._faults_reported += 1
             self.bus.publish(
                 Event.of(
@@ -473,6 +473,33 @@ class Platform:
                 )
             )
             return result
+
+    def acknowledge_fault(self, rack_id: str | None = None) -> dict:
+        """人工确认一簇当前代故障（人工恢复模式下的必要条件）。"""
+
+        with self._lock:
+            key = rack_id or DEFAULT_RACK
+            result = self.bms.acknowledge_fault(key)
+            self.bus.publish(
+                Event.of(
+                    "bms",
+                    "bms",
+                    "fault_acknowledge",
+                    station=self.station,
+                    severity="notice",
+                    rack_id=key,
+                    generation=result.get("generation"),
+                    released=result.get("released"),
+                )
+            )
+            return result
+
+    def observe_condition(self, rack_id: str | None = None, violating: bool = False) -> dict:
+        """显式上报一簇条件采样（测试/现场覆盖用，周期循环会自动采样）。"""
+
+        with self._lock:
+            key = rack_id or DEFAULT_RACK
+            return self.bms.observe_condition(key, bool(violating))
 
     def clear_fault(self, rack_id: str | None = None) -> dict:
         """清除某簇故障计数与闩锁。"""
@@ -569,12 +596,17 @@ class Platform:
                 self.trend.append(f"{rack_id}.temperature", now, rack.temperature_c())
                 self.trend.append(f"{rack_id}.voltage", now, rack.voltage_v())
                 violations = self.bms.protection(rack)
+                # 把真实越限情况喂给每簇闩锁：持续正常达到停留时长才允许自动
+                # 恢复，任何一次越限都重新计时；咬合状态下绝不因单次正常松开。
+                self.bms.observe_condition(rack_id, bool(violations))
                 if violations:
                     trips.append(f"{rack_id}:{','.join(violations)}")
                     self.pcs.trip(f"protection:{rack_id}")
                 self.bms.ready(rack)
                 estimate = self.soc.value(now)
                 rack.set_soc(estimate.soc_pct)
+            # 统一评估到期恢复（覆盖本周期未采样到的簇与时间语义回退）。
+            recovered_racks = self.bms.sweep_recovery()
             rolled = self.quota.roll(now)
             self.grid.monitor_frequency(50.0, now)
             self._persist()
@@ -583,6 +615,7 @@ class Platform:
                 "temperatures": temperatures,
                 "charge_limit_ratio": ratios,
                 "trips": trips,
+                "recovered": recovered_racks,
                 "quota_rolled": rolled["rolled"],
                 "pcs_state": self.pcs.state_machine.state,
             }
@@ -643,11 +676,13 @@ class Platform:
             thread.join(timeout=30)
         coverage = {rack_id: self.bms.faults.counter(rack_id) for rack_id in rack_ids}
         missing = [rack_id for rack_id, count in coverage.items() if count < self.bms.faults.confirm_rounds]
+        generations = {rack_id: self.bms.latch.generation(rack_id) for rack_id in rack_ids}
         return {
             "rounds": rounds,
             "reports": len(results),
             "coverage": coverage,
             "missing": missing,
+            "generations": generations,
             "latched": sorted(rack_id for rack_id in rack_ids if self.bms.latched(rack_id)),
             "ok": not missing,
         }

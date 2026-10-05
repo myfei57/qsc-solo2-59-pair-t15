@@ -94,9 +94,18 @@ class BmsLimits:
     confirm_rounds: int
     protection_temp_c: float
     protection_delta_mv: float
+    fault_recovery: str = "auto"
+    recover_dwell_s: float | None = None
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "BmsLimits":
+        recovery = str(section.get("fault_recovery", "auto"))
+        if recovery not in ("auto", "manual"):
+            raise ConfigError("fault_recovery 必须是 auto 或 manual", component="config")
+        dwell_raw = section.get("recover_dwell_s")
+        dwell = None
+        if dwell_raw is not None:
+            dwell = _number(section, "recover_dwell_s", minimum=0.0)
         limits = cls(
             ready_delta_mv=_number(section, "ready_delta_mv", minimum=0.0),
             ready_temp_c=_number(section, "ready_temp_c"),
@@ -106,6 +115,8 @@ class BmsLimits:
             confirm_rounds=_integer(section, "confirm_rounds", minimum=1),
             protection_temp_c=_number(section, "protection_temp_c"),
             protection_delta_mv=_number(section, "protection_delta_mv", minimum=0.0),
+            fault_recovery=recovery,
+            recover_dwell_s=dwell,
         )
         if limits.ready_soc_min_pct >= limits.ready_soc_max_pct:
             raise ConfigError("就绪 SOC 下限必须小于上限", component="config")
@@ -115,6 +126,18 @@ class BmsLimits:
         """SOC 是否落在就绪窗口内。"""
 
         return self.ready_soc_min_pct <= float(soc_pct) <= self.ready_soc_max_pct
+
+    @property
+    def recover_dwell_seconds(self) -> float:
+        """条件须持续正常多久才允许恢复；缺省等于闩锁保持时长。"""
+
+        return self.fault_latch_s if self.recover_dwell_s is None else self.recover_dwell_s
+
+    @property
+    def manual_recovery(self) -> bool:
+        """是否要求人工确认才能恢复。"""
+
+        return self.fault_recovery == "manual"
 
 
 @dataclass(frozen=True)
@@ -395,8 +418,7 @@ def default_config() -> StationConfig:
         name="storage-control",
         storage_root="var/state",
         rack=RackLimits(96, 3.2, 3.65, 2.5, 45.0, 55.0, 10.0, 95.0),
-        bms=BmsLimits(60.0, 35.0, 15.0, 92.0, 120.0, 2, 55.0, 120.0),
-        pcs=PcsLimits(500.0, 5.0, 25.0, 2.0, 0.97, 40.0, 4.0, 200.0, 240.0),
+        bms=BmsLimits(60.0, 35.0, 15.0, 92.0, 120.0, 2, 55.0, 120.0),        pcs=PcsLimits(500.0, 5.0, 25.0, 2.0, 0.97, 40.0, 4.0, 200.0, 240.0),
         temp=TempLimits(40.0, 55.0, 0.25, 1800.0, 0.05, 45.0),
         fire=FireLimits(1200.0, 58.0, 30.0, 4.0, 60.0, 4),
         grid=GridLimits(400.0, 450.0, 50.0, 0.2, 10.0),
@@ -431,6 +453,8 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "confirm_rounds": cfg.bms.confirm_rounds,
                 "protection_temp_c": cfg.bms.protection_temp_c,
                 "protection_delta_mv": cfg.bms.protection_delta_mv,
+                "fault_recovery": cfg.bms.fault_recovery,
+                "recover_dwell_s": cfg.bms.recover_dwell_s,
             },
             "pcs": {
                 "max_power_kw": cfg.pcs.max_power_kw,
